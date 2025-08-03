@@ -1,4 +1,4 @@
-# WireGuard Setup Script - Vollständige Anleitung
+# WireGuard Setup Script - Anleitung
 
 **Author:** Call Me Techie  
 **Website:** [https://CallMeTechie.de](https://CallMeTechie.de)  
@@ -31,7 +31,7 @@
 
 Das WireGuard Setup Script ist ein umfassendes Tool zur automatisierten Installation und Verwaltung von WireGuard VPN-Verbindungen. Es unterstützt mehrere Linux-Distributionen und bietet erweiterte Features wie automatische Firewall-Konfiguration, Backup/Restore-Funktionen und Template-basierte Setups.
 
-**Entwickelt von:** [Call Me Techie](https://CallMeTechie.de) - Ihr Experte für Netzwerk- und Server-Technologien
+**Entwickelt von:** [Call Me Techie](https://CallMeTechie.de)
 
 ### Unterstützte Distributionen
 - **Debian/Ubuntu** (apt-basiert) - inklusive Debian 12 (Bookworm)
