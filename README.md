@@ -1,4 +1,6 @@
-# WireGuard Setup Script - Anleitung
+# WireGuard Automatic Installer Script - Anleitung
+
+<img width="1024" height="459" alt="wireguard automatic installer" src="https://github.com/user-attachments/assets/f7098ffa-dbaa-4948-ac01-622fb0660e6e" />
 
 **Author:** Call Me Techie  
 **Website:** [https://CallMeTechie.de](https://CallMeTechie.de)  
