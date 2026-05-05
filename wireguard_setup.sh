@@ -1120,20 +1120,27 @@ install_dependencies() {
     
     case $DISTRO in
         debian)
-            if ! dpkg -l | grep -q wireguard; then
-                eval "$INSTALL_CMD wireguard wireguard-tools"
+            # Kritische Pakete — Installation MUSS funktionieren, sonst Abbruch.
+            # Auf Debian 12 (Bookworm) und Ubuntu 24.04 (Noble) konfligieren ufw und
+            # iptables-persistent. Daher kritische Pakete IMMER separat von den
+            # optionalen Firewall-Persistierungs-Paketen installieren.
+            if ! dpkg -l | grep -q "^ii  wireguard "; then
+                eval "$INSTALL_CMD wireguard wireguard-tools" \
+                    || error "Konnte wireguard/wireguard-tools nicht installieren"
             fi
-            
-            # Debian 12 (Bookworm) Fix für UFW/iptables-persistent Konflikt
-            if grep -q "bookworm" /etc/os-release 2>/dev/null; then
-                log "Debian 12 erkannt - installiere Pakete ohne UFW/iptables-persistent Konflikt..."
-                eval "$INSTALL_CMD qrencode resolvconf curl"
-                # UFW und iptables-persistent separat installieren
-                eval "$INSTALL_CMD netfilter-persistent" 2>/dev/null || true
-                eval "$INSTALL_CMD ufw" 2>/dev/null || warn "UFW konnte nicht installiert werden - verwende iptables"
-            else
-                eval "$INSTALL_CMD qrencode iptables-persistent resolvconf curl ufw"
-            fi
+            eval "$INSTALL_CMD qrencode curl" \
+                || error "Konnte qrencode/curl nicht installieren"
+
+            # Optional: DNS-Helper (manche Cloud-Images haben kein resolvconf-Paket)
+            eval "$INSTALL_CMD resolvconf" 2>/dev/null \
+                || warn "resolvconf nicht verfuegbar — DNS via wg-quick funktioniert trotzdem"
+
+            # Optional: iptables-Regeln-Persistierung. ufw und netfilter-persistent
+            # konfligieren auf Debian 12 / Ubuntu 24.04 — daher getrennte Versuche.
+            eval "$INSTALL_CMD netfilter-persistent" 2>/dev/null \
+                || warn "netfilter-persistent nicht installiert — iptables-Regeln gehen beim Reboot verloren"
+            eval "$INSTALL_CMD ufw" 2>/dev/null \
+                || warn "UFW nicht installiert — verwende iptables direkt"
             ;;
         rhel|fedora)
             if ! rpm -qa | grep -q wireguard; then
