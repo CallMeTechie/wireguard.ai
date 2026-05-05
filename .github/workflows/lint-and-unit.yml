@@ -1,0 +1,55 @@
+name: Lint & Unit Tests
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'wireguard_setup.sh'
+      - 'tests/**'
+      - '.github/workflows/lint-and-unit.yml'
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+jobs:
+  lint:
+    name: shellcheck + bash -n
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: bash syntax check
+        run: bash -n wireguard_setup.sh
+
+      - name: shellcheck (errors)
+        uses: ludeeus/action-shellcheck@master
+        with:
+          severity: error
+          scandir: '.'
+          additional_files: 'wireguard_setup.sh'
+
+      - name: shfmt diff (informational, non-blocking)
+        continue-on-error: true
+        run: |
+          curl -fsSL --proto '=https' --tlsv1.2 \
+            https://github.com/mvdan/sh/releases/download/v3.8.0/shfmt_v3.8.0_linux_amd64 \
+            -o /usr/local/bin/shfmt
+          chmod +x /usr/local/bin/shfmt
+          shfmt --diff wireguard_setup.sh || true
+
+  unit:
+    name: bats unit tests
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: install bats
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq bats
+
+      - name: bats version
+        run: bats --version
+
+      - name: run unit tests
+        run: bats --print-output-on-failure tests/unit

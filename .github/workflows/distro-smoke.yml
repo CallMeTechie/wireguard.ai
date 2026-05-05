@@ -1,0 +1,45 @@
+name: Distro Smoke Tests
+
+on:
+  push:
+    branches: [main]
+    tags: ['v*']
+    paths:
+      - 'wireguard_setup.sh'
+      - 'tests/smoke/**'
+      - '.github/workflows/distro-smoke.yml'
+  workflow_dispatch:
+
+jobs:
+  smoke:
+    name: ${{ matrix.distro }} (${{ matrix.image }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - distro: debian
+            image: debian:12
+            pre: 'apt-get update -qq && apt-get install -y -qq bash ca-certificates'
+          - distro: debian
+            image: ubuntu:24.04
+            pre: 'apt-get update -qq && apt-get install -y -qq bash ca-certificates'
+          - distro: alpine
+            image: alpine:3.20
+            pre: 'apk add --no-cache bash ca-certificates'
+          - distro: fedora
+            image: fedora:40
+            pre: 'dnf -y install bash ca-certificates'
+          - distro: arch
+            image: archlinux:base
+            pre: 'pacman -Sy --noconfirm bash ca-certificates'
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Smoke test on ${{ matrix.image }}
+        run: |
+          docker run --rm \
+            -v "$PWD:/work" -w /work \
+            "${{ matrix.image }}" \
+            sh -c '${{ matrix.pre }} && bash tests/smoke/distro_smoke.sh ${{ matrix.distro }}'
