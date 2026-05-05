@@ -1784,6 +1784,7 @@ Das Script wird "wie gesehen" bereitgestellt. Obwohl es sorgfältig entwickelt u
 - **v1.1** - Template-System und erweiterte Client-Verwaltung
 - **v1.2** - Backup/Restore-System und Firewall-Integration
 - **v1.3** - Automatische Updates und Debian 12 Kompatibilität
+- **v1.4** - Sicherheits- und Stabilitäts-Fixes (SHA256-verifiziertes Auto-Update, awk-basiertes `remove_client`, `SaveConfig=false`, vollständiger CSV-Bulk-Import, Eingabe-Validierung)
 
 ---
 
