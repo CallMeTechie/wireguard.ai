@@ -1075,7 +1075,10 @@ install_dependencies() {
             if ! apk info -e wireguard-tools &>/dev/null; then
                 eval "$INSTALL_CMD wireguard-tools"
             fi
-            eval "$INSTALL_CMD qrencode iptables curl"
+            # Auf Alpine heißt das Paket mit dem qrencode-CLI "libqrencode-tools".
+            # "qrencode" ohne Präfix existiert nicht und "libqrencode" ist nur die
+            # Shared Library ohne Binary. Siehe Issue #1.
+            eval "$INSTALL_CMD libqrencode-tools iptables curl"
             ;;
     esac
     
