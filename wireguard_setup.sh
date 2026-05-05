@@ -76,6 +76,10 @@ GITHUB_REPO="CallMeTechie/wireguard.ai"
 GITHUB_API="https://api.github.com/repos/${GITHUB_REPO}"
 GITHUB_RAW="https://raw.githubusercontent.com/${GITHUB_REPO}/main"
 
+# Originale Script-Argumente, damit Auto-Update sich korrekt mit denselben Args neu starten kann
+# (eine Funktion sieht $@ der Funktion, nicht des Scripts).
+ORIG_ARGS=("$@")
+
 # Logging Funktionen
 log() {
     echo -e "${GREEN}[INFO]${NC} $1"
@@ -412,82 +416,105 @@ list_clients() {
     fi
 }
 
-# Client löschen
-remove_client() {
-    list_clients
-    
-    read -p "Client-Name zum Löschen: " client_name
-    
-    if [[ -z "$client_name" ]]; then
+# Erlaubt nur sichere Zeichen in Client-Namen (kein Pfad-Traversal, keine Shell-Sonderzeichen).
+validate_client_name() {
+    local name="$1"
+    if [[ -z "$name" ]]; then
         warn "Kein Client-Name angegeben"
         return 1
     fi
-    
+    if [[ ! "$name" =~ ^[A-Za-z0-9_-]{1,32}$ ]]; then
+        warn "Ungültiger Client-Name: erlaubt sind nur Buchstaben, Ziffern, '_' und '-' (max. 32 Zeichen)"
+        return 1
+    fi
+    return 0
+}
+
+# Client löschen
+remove_client() {
+    list_clients
+
+    read -p "Client-Name zum Löschen: " client_name
+
+    validate_client_name "$client_name" || return 1
+
+    if [[ ! -f "$CONFIG_DIR/wg0.conf" ]]; then
+        warn "Keine WireGuard-Konfiguration gefunden"
+        return 1
+    fi
+
     # Backup vor Änderung
     create_backup "before_remove_${client_name}_$(date +%Y%m%d_%H%M%S)"
-    
-    # Client aus Konfiguration entfernen
-    local temp_file=$(mktemp)
-    local in_client_section=false
-    local client_found=false
-    
-    while IFS= read -r line; do
-        if [[ $line =~ ^\[Peer\] ]]; then
-            in_client_section=true
-            current_peer_start=$line
-        elif [[ $line =~ ^#[[:space:]]*(.+) ]] && [[ $in_client_section == true ]]; then
-            if [[ "${BASH_REMATCH[1]}" == "$client_name" ]]; then
-                client_found=true
-                log "Entferne Client: $client_name"
-                # Überspringe diese Peer-Sektion
-                while IFS= read -r line && [[ ! $line =~ ^\[Peer\] ]] && [[ -n "$line" ]]; do
-                    :  # Zeilen überspringen
-                done
-                if [[ $line =~ ^\[Peer\] ]]; then
-                    echo "$line" >> "$temp_file"
-                    in_client_section=true
-                else
-                    in_client_section=false
-                fi
-                continue
-            fi
-        elif [[ $line =~ ^\[Interface\] ]]; then
-            in_client_section=false
-        fi
-        
-        echo "$line" >> "$temp_file"
-    done < "$CONFIG_DIR/wg0.conf"
-    
-    if [[ $client_found == true ]]; then
-        mv "$temp_file" "$CONFIG_DIR/wg0.conf"
-        
-        # Client-Konfigurationsdatei löschen
-        if [[ -f "$CLIENTS_DIR/${client_name}.conf" ]]; then
-            rm "$CLIENTS_DIR/${client_name}.conf"
-        fi
-        
-        # Schlüssel löschen
-        if [[ -f "$CONFIG_DIR/keys/${client_name}_private.key" ]]; then
-            rm "$CONFIG_DIR/keys/${client_name}_private.key"
-            rm "$CONFIG_DIR/keys/${client_name}_public.key"
-        fi
-        
-        # Service neu starten
-        manage_service restart
-        
-        success "Client '$client_name' erfolgreich entfernt"
-    else
-        rm "$temp_file"
-        warn "Client '$client_name' nicht gefunden"
+
+    # Sektion entfernen: ein Peer-Block beginnt mit [Peer] und endet vor der nächsten
+    # [Interface]/[Peer]-Header. Wir identifizieren ihn anhand des Kommentars
+    # "# CLIENT_NAME" innerhalb der Sektion und überspringen alle Zeilen dieser Sektion.
+    local temp_file
+    temp_file=$(mktemp)
+
+    awk -v target="$client_name" '
+        BEGIN { in_peer = 0; buf = ""; skip = 0 }
+        function flush_buf() {
+            if (buf != "") { printf "%s", buf; buf = "" }
+        }
+        /^[[:space:]]*\[Peer\][[:space:]]*$/ {
+            flush_buf()
+            in_peer = 1; skip = 0
+            buf = $0 "\n"
+            next
+        }
+        /^[[:space:]]*\[[^]]+\][[:space:]]*$/ {
+            if (in_peer && !skip) flush_buf()
+            in_peer = 0; skip = 0; buf = ""
+            print
+            next
+        }
+        {
+            if (in_peer) {
+                # Kommentar mit Client-Namen?
+                if (match($0, /^[[:space:]]*#[[:space:]]*([^[:space:]].*)$/, m)) {
+                    name = m[1]
+                    sub(/[[:space:]]+$/, "", name)
+                    if (name == target) { skip = 1; buf = ""; next }
+                }
+                if (!skip) buf = buf $0 "\n"
+            } else {
+                print
+            }
+        }
+        END { if (in_peer && !skip) flush_buf() }
+    ' "$CONFIG_DIR/wg0.conf" > "$temp_file"
+
+    # Wurde wirklich etwas entfernt?
+    if cmp -s "$CONFIG_DIR/wg0.conf" "$temp_file"; then
+        rm -f "$temp_file"
+        warn "Client '$client_name' nicht in $CONFIG_DIR/wg0.conf gefunden"
+        return 1
     fi
+
+    log "Entferne Client: $client_name"
+    # Atomarer Replace mit Original-Permissions
+    chmod --reference="$CONFIG_DIR/wg0.conf" "$temp_file" 2>/dev/null || chmod 600 "$temp_file"
+    mv "$temp_file" "$CONFIG_DIR/wg0.conf"
+
+    # Client-Konfigurationsdatei und Schlüssel entfernen
+    rm -f "$CLIENTS_DIR/${client_name}.conf"
+    rm -f "$CONFIG_DIR/keys/${client_name}_private.key" \
+          "$CONFIG_DIR/keys/${client_name}_public.key"
+
+    # Live-Reload statt Service-Restart
+    reload_wg_config
+
+    success "Client '$client_name' erfolgreich entfernt"
 }
 
 # Client bearbeiten
 edit_client() {
     list_clients
-    
+
     read -p "Client-Name zum Bearbeiten: " client_name
-    
+    validate_client_name "$client_name" || return 1
+
     if [[ ! -f "$CLIENTS_DIR/${client_name}.conf" ]]; then
         warn "Client-Konfiguration nicht gefunden"
         return 1
@@ -608,22 +635,22 @@ check_script_updates() {
     local latest_version=""
     local current_version="$SCRIPT_VERSION"
     
-    # GitHub API verwenden um neueste Version zu ermitteln
-    if command -v curl &> /dev/null; then
-        latest_version=$(curl -s "$GITHUB_API/releases/latest" 2>/dev/null | grep '"tag_name":' | cut -d'"' -f4 | sed 's/^v//')
-        
-        if [[ -z "$latest_version" ]]; then
-            # Fallback: Neueste Version aus main branch
-            latest_version=$(curl -s "$GITHUB_RAW/$SCRIPT_NAME" 2>/dev/null | grep 'SCRIPT_VERSION=' | head -1 | cut -d'"' -f2)
+    # GitHub API verwenden um neueste Version zu ermitteln (HTTPS+TLS1.2 erzwungen)
+    local tmp_meta
+    tmp_meta=$(mktemp)
+    if secure_fetch "$GITHUB_API/releases/latest" "$tmp_meta"; then
+        latest_version=$(grep '"tag_name":' "$tmp_meta" | head -1 | cut -d'"' -f4 | sed 's/^v//')
+    fi
+
+    if [[ -z "$latest_version" ]]; then
+        # Fallback: Neueste Version aus main branch
+        if secure_fetch "$GITHUB_RAW/$SCRIPT_NAME" "$tmp_meta"; then
+            latest_version=$(grep 'SCRIPT_VERSION=' "$tmp_meta" | head -1 | cut -d'"' -f2)
         fi
-    elif command -v wget &> /dev/null; then
-        latest_version=$(wget -qO- "$GITHUB_API/releases/latest" 2>/dev/null | grep '"tag_name":' | cut -d'"' -f4 | sed 's/^v//')
-        
-        if [[ -z "$latest_version" ]]; then
-            # Fallback: Neueste Version aus main branch
-            latest_version=$(wget -qO- "$GITHUB_RAW/$SCRIPT_NAME" 2>/dev/null | grep 'SCRIPT_VERSION=' | head -1 | cut -d'"' -f2)
-        fi
-    else
+    fi
+    rm -f "$tmp_meta"
+
+    if ! command -v curl &> /dev/null && ! command -v wget &> /dev/null; then
         warn "Weder curl noch wget verfügbar - kann Updates nicht prüfen"
         return 1
     fi
@@ -655,61 +682,108 @@ check_script_updates() {
     fi
 }
 
-# Script automatisch aktualisieren
+# Sicherer HTTPS-Download (TLS 1.2+, kein HTTP-Fallback, kein Redirect zu http://).
+secure_fetch() {
+    local url="$1"
+    local out="$2"
+    if command -v curl &> /dev/null; then
+        curl --proto '=https' --tlsv1.2 -fsSL --max-time 30 "$url" -o "$out"
+    elif command -v wget &> /dev/null; then
+        wget --https-only --secure-protocol=TLSv1_2 -q --timeout=30 "$url" -O "$out"
+    else
+        return 127
+    fi
+}
+
+# Script automatisch aktualisieren — mit SHA256-Verifikation gegen Release-Asset.
+# Bricht ab, wenn keine SHA256SUMS gefunden wird oder die Prüfsumme nicht passt.
 update_script() {
     local new_version="$1"
+    local tag="v${new_version}"
+
+    echo ""
+    echo -e "${YELLOW}WARNUNG:${NC} Auto-Update lädt Code von GitHub und führt ihn als root aus."
+    echo "Verifikation erfolgt über SHA256SUMS aus dem Release-Asset."
+    echo "Repository: https://github.com/$GITHUB_REPO/releases/tag/$tag"
+    read -p "Wirklich fortfahren? (ja/nein): " confirm_update
+    if [[ "$confirm_update" != "ja" ]]; then
+        log "Update abgebrochen"
+        return 1
+    fi
+
     log "Lade Script-Update herunter..."
-    
+
     # Backup des aktuellen Scripts
     local backup_name="script_backup_v${SCRIPT_VERSION}_$(date +%Y%m%d_%H%M%S)"
-    cp "$SCRIPT_DIR/$SCRIPT_NAME" "$SCRIPT_DIR/$backup_name" || {
-        error "Konnte Script-Backup nicht erstellen"
-    }
-    
+    cp "$SCRIPT_DIR/$SCRIPT_NAME" "$SCRIPT_DIR/$backup_name" \
+        || error "Konnte Script-Backup nicht erstellen"
     log "Backup erstellt: $backup_name"
-    
-    # Neue Version herunterladen
-    local temp_script="/tmp/wireguard_setup_new.sh"
-    
-    if command -v curl &> /dev/null; then
-        curl -sL "$GITHUB_RAW/$SCRIPT_NAME" -o "$temp_script" || {
+
+    # Download-Quellen: Release-Tag bevorzugt, main-Branch als Fallback (mit Warnung)
+    local base_release="https://github.com/${GITHUB_REPO}/releases/download/${tag}"
+    local temp_script
+    local temp_sums
+    temp_script=$(mktemp /tmp/wireguard_setup_new.XXXXXX.sh)
+    temp_sums=$(mktemp /tmp/wireguard_setup_sums.XXXXXX)
+    trap 'rm -f "$temp_script" "$temp_sums"' RETURN
+
+    local from_release=true
+    if ! secure_fetch "${base_release}/${SCRIPT_NAME}" "$temp_script"; then
+        warn "Release-Asset nicht gefunden, falle auf main-Branch zurück (KEINE Hash-Verifikation möglich)"
+        from_release=false
+        if ! secure_fetch "${GITHUB_RAW}/${SCRIPT_NAME}" "$temp_script"; then
             error "Download fehlgeschlagen"
-        }
-    elif command -v wget &> /dev/null; then
-        wget -q "$GITHUB_RAW/$SCRIPT_NAME" -O "$temp_script" || {
-            error "Download fehlgeschlagen"
-        }
+        fi
+    fi
+
+    if [[ ! -s "$temp_script" ]]; then
+        error "Heruntergeladene Datei ist leer"
+    fi
+
+    # SHA256-Verifikation gegen Release-SHA256SUMS
+    if [[ "$from_release" == true ]]; then
+        if ! secure_fetch "${base_release}/SHA256SUMS" "$temp_sums"; then
+            error "SHA256SUMS aus dem Release nicht abrufbar — Update aus Sicherheitsgründen abgebrochen"
+        fi
+        local expected
+        expected=$(awk -v f="$SCRIPT_NAME" '$2 == f || $2 == "*"f { print $1; exit }' "$temp_sums")
+        if [[ -z "$expected" ]]; then
+            error "Keine Prüfsumme für $SCRIPT_NAME in SHA256SUMS — Update abgebrochen"
+        fi
+        local actual
+        actual=$(sha256sum "$temp_script" | awk '{print $1}')
+        if [[ "$expected" != "$actual" ]]; then
+            error "SHA256-Mismatch! erwartet=$expected actual=$actual — Update abgebrochen"
+        fi
+        success "SHA256-Prüfsumme verifiziert"
     else
-        error "Weder curl noch wget verfügbar"
+        echo ""
+        warn "Du installierst die main-Branch-Version OHNE Signaturprüfung."
+        read -p "Trotzdem fortfahren? (ja/nein): " confirm_unsafe
+        [[ "$confirm_unsafe" == "ja" ]] || { log "Update abgebrochen"; return 1; }
     fi
-    
-    # Validierung der heruntergeladenen Datei
-    if [[ ! -f "$temp_script" ]] || [[ ! -s "$temp_script" ]]; then
-        error "Heruntergeladene Datei ist ungültig"
-    fi
-    
-    # Prüfe ob es ein gültiges Bash-Script ist
+
+    # Bash-Syntax prüfen, bevor wir uns selbst überschreiben
     if ! bash -n "$temp_script"; then
-        error "Heruntergeladenes Script hat Syntaxfehler"
+        error "Heruntergeladenes Script hat Syntaxfehler — Update abgebrochen"
     fi
-    
-    # Script ersetzen
+
     chmod +x "$temp_script"
-    mv "$temp_script" "$SCRIPT_DIR/$SCRIPT_NAME" || {
-        error "Konnte Script nicht aktualisieren"
-    }
-    
+    # Atomarer Replace
+    mv "$temp_script" "$SCRIPT_DIR/$SCRIPT_NAME" \
+        || error "Konnte Script nicht aktualisieren"
+
     success "Script erfolgreich auf Version $new_version aktualisiert!"
-    
     echo ""
     echo -e "${BLUE}Changelog verfügbar unter:${NC}"
-    echo "https://github.com/$GITHUB_REPO/releases/tag/v$new_version"
+    echo "https://github.com/$GITHUB_REPO/releases/tag/$tag"
     echo ""
-    
+
     read -p "Script neu starten mit neuer Version? (j/n): " restart_script
     if [[ $restart_script =~ ^[Jj] ]]; then
         log "Starte Script mit neuer Version neu..."
-        exec "$SCRIPT_DIR/$SCRIPT_NAME" "$@"
+        # ORIG_ARGS sind die Args, mit denen das Script ursprünglich aufgerufen wurde.
+        exec "$SCRIPT_DIR/$SCRIPT_NAME" "${ORIG_ARGS[@]}"
     fi
 }
 
@@ -1008,6 +1082,20 @@ install_dependencies() {
     log "Abhängigkeiten erfolgreich installiert"
 }
 
+# Live-Reload der wg0-Konfiguration ohne Verbindungsabbruch.
+# wg syncconf übernimmt Peer-Änderungen aus der Datei, ohne das Interface zu stoppen.
+# Fällt auf einen vollen Restart zurück, wenn wg0 nicht läuft oder strip/syncconf fehlt.
+reload_wg_config() {
+    local iface="wg0"
+    if command -v wg &>/dev/null && ip link show "$iface" &>/dev/null; then
+        if wg-quick strip "$iface" 2>/dev/null | wg syncconf "$iface" /dev/stdin 2>/dev/null; then
+            log "WireGuard-Konfiguration live übernommen (wg syncconf)"
+            return 0
+        fi
+    fi
+    manage_service restart
+}
+
 # Service Management
 manage_service() {
     local action=$1
@@ -1092,12 +1180,14 @@ setup_server_with_template() {
     SERVER_PUBLIC_KEY=$(cat "$CONFIG_DIR/keys/server_public.key")
     
     # Server-Konfiguration mit Firewall-Integration
-    cat > "$CONFIG_DIR/wg0.conf" << EOF
+    # SaveConfig=false: sonst überschreibt wg-quick beim down die Datei und
+    # löscht alle Peer-Kommentare (# CLIENT_NAME), an denen die Client-Verwaltung hängt.
+    (umask 077 && cat > "$CONFIG_DIR/wg0.conf" << EOF
 [Interface]
 PrivateKey = $SERVER_PRIVATE_KEY
 Address = $SERVER_IP
 ListenPort = $WG_PORT
-SaveConfig = true
+SaveConfig = false
 
 # Firewall Regeln
 PostUp = iptables -A FORWARD -i %i -j ACCEPT; iptables -A FORWARD -o %i -j ACCEPT; iptables -t nat -A POSTROUTING -o $INTERFACE -j MASQUERADE
@@ -1105,6 +1195,7 @@ PostDown = iptables -D FORWARD -i %i -j ACCEPT; iptables -D FORWARD -o %i -j ACC
 
 # Clients werden hier automatisch hinzugefügt
 EOF
+)
 
     # Firewall konfigurieren
     configure_firewall "add" "$WG_PORT" "$INTERFACE"
@@ -1147,10 +1238,22 @@ setup_server() {
 # Client zum Server hinzufügen
 add_client_to_server() {
     log "Füge neuen Client hinzu..."
-    
+
     read -p "Client Name: " CLIENT_NAME
+    validate_client_name "$CLIENT_NAME" || return 1
+
+    if [[ -f "$CONFIG_DIR/keys/${CLIENT_NAME}_private.key" ]] \
+        || grep -qE "^[[:space:]]*#[[:space:]]*${CLIENT_NAME}[[:space:]]*$" "$CONFIG_DIR/wg0.conf" 2>/dev/null; then
+        warn "Client '$CLIENT_NAME' existiert bereits"
+        return 1
+    fi
+
     read -p "Client IP im VPN (z.B. 10.0.0.2/32): " CLIENT_IP
-    
+    if [[ ! "$CLIENT_IP" =~ ^[0-9]{1,3}(\.[0-9]{1,3}){3}/[0-9]{1,2}$ ]]; then
+        warn "Ungültige Client-IP: $CLIENT_IP"
+        return 1
+    fi
+
     # Backup vor Änderung
     create_backup "before_add_${CLIENT_NAME}_$(date +%Y%m%d_%H%M%S)"
     
@@ -1168,7 +1271,7 @@ PublicKey = $CLIENT_PUBLIC_KEY
 AllowedIPs = $CLIENT_IP
 EOF
 
-    manage_service restart
+    reload_wg_config
     
     # Client-Konfiguration erstellen
     SERVER_PUBLIC_KEY=$(cat "$CONFIG_DIR/keys/server_public.key")
@@ -1278,11 +1381,107 @@ show_status() {
     fi
 }
 
-# Bulk-Import von Clients
+# Bulk-Import von Clients aus CSV.
+# Erwartet wird /tmp/wireguard_clients.csv mit Header: name,ip,dns,allowed_ips
 bulk_import_clients() {
-    warn "Bulk-Import Funktion ist implementiert, benötigt aber CSV-Datei"
-    echo "Erwartetes CSV-Format: name,ip,dns"
-    echo "Beispiel: client1,10.0.0.2/32,8.8.8.8"
+    local csv_default="/tmp/wireguard_clients.csv"
+    read -p "Pfad zur CSV (leer = $csv_default): " csv_path
+    csv_path="${csv_path:-$csv_default}"
+
+    if [[ ! -f "$csv_path" ]]; then
+        warn "CSV-Datei nicht gefunden: $csv_path"
+        echo "Erwartetes Format (eine Zeile Header, dann Clients):"
+        echo "  name,ip,dns,allowed_ips"
+        echo "  laptop-user,10.0.0.2/32,8.8.8.8,0.0.0.0/0"
+        return 1
+    fi
+
+    if [[ ! -f "$CONFIG_DIR/wg0.conf" ]] \
+        || ! grep -q "^[[:space:]]*ListenPort" "$CONFIG_DIR/wg0.conf"; then
+        warn "Kein WireGuard-Server gefunden — Server zuerst einrichten"
+        return 1
+    fi
+
+    # Header verifizieren (toleriert Reihenfolge name,ip,dns,allowed_ips)
+    local header
+    IFS= read -r header < "$csv_path"
+    header="${header%$'\r'}"
+    if [[ "$header" != "name,ip,dns,allowed_ips" ]]; then
+        warn "Ungültiger CSV-Header: '$header'"
+        echo "Erwartet: name,ip,dns,allowed_ips"
+        return 1
+    fi
+
+    create_backup "before_bulk_import_$(date +%Y%m%d_%H%M%S)"
+
+    local server_pub server_endpoint server_port
+    server_pub=$(cat "$CONFIG_DIR/keys/server_public.key")
+    server_port=$(grep "^[[:space:]]*ListenPort" "$CONFIG_DIR/wg0.conf" | awk '{print $3}')
+    server_endpoint="$(get_external_ip):${server_port}"
+
+    mkdir -p "$CLIENTS_DIR" "$CONFIG_DIR/keys"
+
+    local added=0 skipped=0 failed=0 line_no=1
+    while IFS=',' read -r name ip dns allowed_ips || [[ -n "$name" ]]; do
+        ((line_no++))
+        # CR aus möglichen Windows-Zeilenenden entfernen
+        name="${name%$'\r'}"; ip="${ip%$'\r'}"
+        dns="${dns%$'\r'}"; allowed_ips="${allowed_ips%$'\r'}"
+        # Leerzeilen überspringen
+        [[ -z "$name" && -z "$ip" ]] && continue
+
+        if ! validate_client_name "$name" 2>/dev/null; then
+            warn "Zeile $line_no: ungültiger Client-Name '$name' — übersprungen"
+            ((failed++)); continue
+        fi
+        if [[ ! "$ip" =~ ^[0-9]{1,3}(\.[0-9]{1,3}){3}/[0-9]{1,2}$ ]]; then
+            warn "Zeile $line_no: ungültige IP '$ip' — übersprungen"
+            ((failed++)); continue
+        fi
+        if [[ -z "$dns" ]]; then dns="8.8.8.8"; fi
+        if [[ -z "$allowed_ips" ]]; then allowed_ips="0.0.0.0/0"; fi
+
+        if [[ -f "$CONFIG_DIR/keys/${name}_private.key" ]] \
+            || grep -qE "^[[:space:]]*#[[:space:]]*${name}[[:space:]]*$" "$CONFIG_DIR/wg0.conf"; then
+            warn "Zeile $line_no: Client '$name' existiert bereits — übersprungen"
+            ((skipped++)); continue
+        fi
+
+        generate_keys "$CONFIG_DIR/keys" "$name"
+        local client_priv client_pub
+        client_priv=$(cat "$CONFIG_DIR/keys/${name}_private.key")
+        client_pub=$(cat "$CONFIG_DIR/keys/${name}_public.key")
+
+        cat >> "$CONFIG_DIR/wg0.conf" << EOF
+
+[Peer]
+# $name
+PublicKey = $client_pub
+AllowedIPs = $ip
+EOF
+
+        (umask 077 && cat > "$CLIENTS_DIR/${name}.conf" << EOF
+[Interface]
+PrivateKey = $client_priv
+Address = $ip
+DNS = $dns
+
+[Peer]
+PublicKey = $server_pub
+Endpoint = $server_endpoint
+AllowedIPs = $allowed_ips
+PersistentKeepalive = 25
+EOF
+)
+        ((added++))
+        log "Importiert: $name ($ip)"
+    done < <(tail -n +2 "$csv_path")
+
+    if (( added > 0 )); then
+        reload_wg_config
+    fi
+
+    success "Import fertig: $added hinzugefügt, $skipped übersprungen, $failed fehlerhaft"
 }
 
 # Alle Clients exportieren
