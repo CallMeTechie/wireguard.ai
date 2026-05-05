@@ -49,7 +49,13 @@
 # - QR-Code-Generierung
 #===============================================================================
 
-set -e
+# Hinweis: bewusst KEIN `set -e`. Dieses Skript ist interaktiv und nutzt
+# durchgehend Patterns wie `cmd 2>/dev/null || true`, Service-Checks, die
+# legitimerweise non-zero zurückgeben, sowie eingelesene Benutzereingaben.
+# Mit `set -e` würde jeder solche Pfad das Skript mitten im Setup abbrechen.
+# Stattdessen wird Fehlerbehandlung gezielt an den kritischen Stellen via
+# `||` und der `error`-Funktion durchgeführt.
+set -o pipefail
 
 # Farben für Ausgabe
 RED='\033[0;31m'
@@ -66,12 +72,15 @@ PACKAGE_MANAGER=""
 INSTALL_CMD=""
 UPDATE_CMD=""
 SERVICE_MANAGER="systemctl"
-SCRIPT_VERSION="1.4.1"
+SCRIPT_VERSION="1.4.2"
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 SCRIPT_NAME="$(basename "${BASH_SOURCE[0]}")"
 BACKUP_DIR="/etc/wireguard/backups"
 CONFIG_DIR="/etc/wireguard"
 CLIENTS_DIR="/etc/wireguard/clients"
+# Anzahl Backups, die behalten werden — ältere werden nach jedem create_backup gelöscht.
+# Per Env-Var BACKUP_KEEP überschreibbar. 0 = unbegrenzt (kein Cleanup).
+BACKUP_KEEP="${BACKUP_KEEP:-20}"
 GITHUB_REPO="CallMeTechie/wireguard.ai"
 GITHUB_API="https://api.github.com/repos/${GITHUB_REPO}"
 GITHUB_RAW="https://raw.githubusercontent.com/${GITHUB_REPO}/main"
@@ -156,11 +165,7 @@ detect_distro() {
                 SERVICE_MANAGER="rc-service"
                 ;;
             *)
-                warn "Unbekannte Distribution: $ID"
-                DISTRO="unknown"
-                PACKAGE_MANAGER="apt"
-                INSTALL_CMD="apt install -y"
-                UPDATE_CMD="apt update"
+                error "Nicht unterstützte Distribution: $ID. Unterstützt werden: debian/ubuntu, centos/rhel/rocky/almalinux, fedora, arch/manjaro, opensuse/sles, alpine. Bitte ein Issue eröffnen: https://github.com/$GITHUB_REPO/issues"
                 ;;
         esac
     else
@@ -182,6 +187,23 @@ detect_firewall() {
         echo "iptables"
     else
         echo "none"
+    fi
+}
+
+# iptables-Regeln distributionspezifisch persistieren.
+# Wenn keiner der Persistierungs-Pfade verfügbar ist, wird gewarnt — Regeln
+# bleiben dann bis zum Reboot aktiv.
+persist_iptables() {
+    if command -v netfilter-persistent &>/dev/null; then
+        netfilter-persistent save 2>/dev/null || warn "netfilter-persistent save fehlgeschlagen"
+    elif [[ -d /etc/iptables ]]; then
+        iptables-save > /etc/iptables/rules.v4 2>/dev/null \
+            && log "iptables-Regeln gespeichert nach /etc/iptables/rules.v4"
+    elif [[ -f /etc/sysconfig/iptables ]]; then
+        iptables-save > /etc/sysconfig/iptables 2>/dev/null \
+            && log "iptables-Regeln gespeichert nach /etc/sysconfig/iptables"
+    else
+        warn "Keine bekannte iptables-Persistierung gefunden — Regeln gehen beim Reboot verloren"
     fi
 }
 
@@ -222,7 +244,24 @@ configure_firewall() {
             ;;
         iptables)
             log "Konfiguriere iptables..."
-            # Manuelle iptables-Regeln (wie bisher)
+            if [[ $action == "add" ]]; then
+                iptables -C INPUT -p udp --dport "$port" -j ACCEPT 2>/dev/null \
+                    || iptables -A INPUT -p udp --dport "$port" -j ACCEPT
+                iptables -C FORWARD -i wg0 -j ACCEPT 2>/dev/null \
+                    || iptables -A FORWARD -i wg0 -j ACCEPT
+                iptables -C FORWARD -o wg0 -j ACCEPT 2>/dev/null \
+                    || iptables -A FORWARD -o wg0 -j ACCEPT
+                if [[ -n "$interface" ]]; then
+                    iptables -t nat -C POSTROUTING -o "$interface" -j MASQUERADE 2>/dev/null \
+                        || iptables -t nat -A POSTROUTING -o "$interface" -j MASQUERADE
+                fi
+            else
+                iptables -D INPUT -p udp --dport "$port" -j ACCEPT 2>/dev/null || true
+                iptables -D FORWARD -i wg0 -j ACCEPT 2>/dev/null || true
+                iptables -D FORWARD -o wg0 -j ACCEPT 2>/dev/null || true
+                [[ -n "$interface" ]] && iptables -t nat -D POSTROUTING -o "$interface" -j MASQUERADE 2>/dev/null || true
+            fi
+            persist_iptables
             ;;
         none)
             warn "Keine aktive Firewall erkannt. Empfehle manuelle Konfiguration."
@@ -263,8 +302,36 @@ Script Version: $SCRIPT_VERSION
 Distribution: $DISTRO
 Hostname: $(hostname)
 EOF
-    
+
     success "Backup erstellt: $backup_path"
+    prune_old_backups
+}
+
+# Älteste Backups über dem BACKUP_KEEP-Limit entfernen.
+# Nutzt mtime-basierte Sortierung — aktuelles Backup wurde gerade erstellt und bleibt.
+prune_old_backups() {
+    [[ "$BACKUP_KEEP" -le 0 ]] && return 0
+    [[ ! -d "$BACKUP_DIR" ]] && return 0
+
+    local total
+    total=$(find "$BACKUP_DIR" -mindepth 1 -maxdepth 1 -type d 2>/dev/null | wc -l)
+    if (( total <= BACKUP_KEEP )); then
+        return 0
+    fi
+    local to_delete=$(( total - BACKUP_KEEP ))
+    log "Backup-Retention: lösche $to_delete alte Backup(s) (Limit=$BACKUP_KEEP)"
+
+    # find -printf '%T@ %p\n' → sort numerisch → älteste zuerst → erste N löschen
+    find "$BACKUP_DIR" -mindepth 1 -maxdepth 1 -type d -printf '%T@\t%p\n' 2>/dev/null \
+        | sort -n \
+        | head -n "$to_delete" \
+        | while IFS=$'\t' read -r _ts path; do
+            # Defensive: Pfad muss innerhalb von BACKUP_DIR liegen
+            case "$path" in
+                "$BACKUP_DIR"/*) rm -rf -- "$path" && log "  entfernt: $(basename "$path")" ;;
+                *) warn "  überspringe verdächtigen Pfad: $path" ;;
+            esac
+        done
 }
 
 # Backup wiederherstellen
@@ -368,7 +435,7 @@ manage_backups() {
                 ;;
             5)
                 echo "Automatisches Backup via Cron einrichten..."
-                echo "0 2 * * 0 root $SCRIPT_DIR/$(basename $0) --auto-backup" > /etc/cron.d/wireguard-backup
+                echo "0 2 * * 0 root $SCRIPT_DIR/$SCRIPT_NAME --auto-backup" > /etc/cron.d/wireguard-backup
                 success "Wöchentliches Backup konfiguriert"
                 ;;
             6) break ;;
@@ -977,9 +1044,9 @@ privacy_template() {
     echo "Privacy-Konfiguration:"
     echo "- VPN-Netzwerk: 10.66.0.0/24"
     echo "- Server IP: $SERVER_IP"
-    echo "- Port: $WG_PORT (getarnt als HTTPS)"
+    echo "- Port: $WG_PORT (häufig offen in restriktiven Netzwerken; KEINE echte HTTPS-Tarnung)"
     echo "- DNS: $DNS_SERVER (Quad9 - Privacy-focused)"
-    echo "- Maximale Sicherheitseinstellungen"
+    echo "- Hinweis: WireGuard-Traffic ist UDP und durch Deep-Packet-Inspection erkennbar."
     
     read -p "Diese Einstellungen verwenden? (j/n): " confirm
     if [[ $confirm =~ ^[Jj] ]]; then
@@ -990,13 +1057,23 @@ privacy_template() {
 # Custom Template
 custom_template() {
     log "Konfiguriere Custom Template..."
-    
+
     read -p "Server IP-Adresse im VPN (z.B. 10.0.0.1/24): " SERVER_IP
     read -p "WireGuard Port (Standard: 51820): " WG_PORT
     WG_PORT=${WG_PORT:-51820}
     read -p "DNS Server (z.B. 8.8.8.8): " DNS_SERVER
     DNS_SERVER=${DNS_SERVER:-8.8.8.8}
-    
+
+    # Optionaler IPv6-Dual-Stack
+    SERVER_IPV6=""
+    read -p "IPv6 Dual-Stack aktivieren? (j/n, Standard n): " enable_v6
+    if [[ "$enable_v6" =~ ^[Jj] ]]; then
+        read -p "IPv6 ULA-Prefix (z.B. fd42:42:42::1/64): " SERVER_IPV6
+        SERVER_IPV6=${SERVER_IPV6:-fd42:42:42::1/64}
+        # Erweitert SERVER_IP zu Dual-Stack-Address-Liste
+        SERVER_IP="${SERVER_IP}, ${SERVER_IPV6}"
+    fi
+
     setup_server_with_template
 }
 
@@ -1155,13 +1232,21 @@ get_external_ip() {
 }
 
 # Schlüssel generieren
+# Die Privatekey-Datei muss zu KEINEM Zeitpunkt für andere Nutzer lesbar sein.
+# Daher wird sie in einer Subshell mit umask 077 erzeugt — chmod nach dem Schreiben
+# wäre eine Race Condition.
 generate_keys() {
     local key_path=$1
     local key_name=$2
-    
+
     if [[ ! -f "$key_path/${key_name}_private.key" ]]; then
         log "Generiere Schlüssel für $key_name..."
-        wg genkey | tee "$key_path/${key_name}_private.key" | wg pubkey > "$key_path/${key_name}_public.key"
+        mkdir -p "$key_path"
+        chmod 700 "$key_path"
+        (
+            umask 077
+            wg genkey | tee "$key_path/${key_name}_private.key" | wg pubkey > "$key_path/${key_name}_public.key"
+        )
         chmod 600 "$key_path/${key_name}_private.key"
         chmod 644 "$key_path/${key_name}_public.key"
     fi
@@ -1314,8 +1399,24 @@ EOF
 # Client Setup
 setup_client() {
     log "Richte WireGuard Client ein..."
-    
+
+    # Schutz gegen versehentliches Überschreiben einer Server-Konfiguration.
+    # ListenPort ist nur in Server-Configs gesetzt, nicht in Client-Configs.
+    if [[ -f "$CONFIG_DIR/wg0.conf" ]] \
+        && grep -qE "^[[:space:]]*ListenPort" "$CONFIG_DIR/wg0.conf"; then
+        warn "Auf diesem Host ist bereits ein WireGuard-SERVER konfiguriert ($CONFIG_DIR/wg0.conf)."
+        warn "Dieser Modus würde die Server-Konfiguration überschreiben."
+        read -p "Wirklich überschreiben? (ja/nein): " confirm_overwrite
+        if [[ "$confirm_overwrite" != "ja" ]]; then
+            log "Client-Setup abgebrochen — Server-Konfiguration bleibt erhalten"
+            return 1
+        fi
+        # Sicherheitsbackup ANSTATT der ersten Aktion
+        create_backup "before_client_overwrite_$(date +%Y%m%d_%H%M%S)"
+    fi
+
     read -p "Client Name: " CLIENT_NAME
+    validate_client_name "$CLIENT_NAME" || return 1
     read -p "Server Public Key: " SERVER_PUBLIC_KEY
     read -p "Server Endpoint (IP:Port): " SERVER_ENDPOINT
     read -p "Client IP im VPN (z.B. 10.0.0.2/32): " CLIENT_IP

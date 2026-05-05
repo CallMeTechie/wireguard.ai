@@ -1021,7 +1021,7 @@ chmod +x wireguard_setup.sh
 | **Enterprise** | Unternehmen | 172.16.0.0/16 | 51820 | 172.16.0.1 | Große Netze |
 | **Road Warrior** | Mobile Clients | 192.168.99.0/24 | 51820 | 1.1.1.1 | Extern optimiert |
 | **Gaming** | Gaming/Latenz | 10.10.0.0/24 | 51820 | 8.8.8.8 | Niedrige Latenz |
-| **Privacy** | Anonymität | 10.66.0.0/24 | 443 | 9.9.9.9 | Getarnt als HTTPS |
+| **Privacy** | Anonymität | 10.66.0.0/24 | 443 | 9.9.9.9 | Port 443 (häufig offen) |
 | **Custom** | Benutzerdefiniert | Variable | Variable | Variable | Individuelle Werte |
 
 ### Homelab Template
@@ -1149,16 +1149,18 @@ sysctl -p
 ```ini
 # Server
 Address = 10.66.0.1/24
-ListenPort = 443  # Getarnt als HTTPS-Traffic
+ListenPort = 443  # Port 443 ist in vielen restriktiven Netzwerken offen
 DNS = 9.9.9.9     # Quad9 - privatsphäreorientiert
 
 # Zusätzliche Sicherheitsfeatures
 PreSharedKey = <generiert>
 ```
 
+> **Hinweis zur Tarnung:** HTTPS ist TCP, WireGuard ist UDP. Port 443/UDP ist im Netz QUIC-Traffic und durch moderne Deep-Packet-Inspection als Nicht-QUIC erkennbar. Port 443 wird hier verwendet, weil er in vielen Firewalls/Captive-Portals offen ist — nicht als echte Protokoll-Tarnung.
+
 **Erweiterte Privacy-Features:**
 ```bash
-# Obfuscation durch Port 443
+# Port 443 als ungewöhnlicher WireGuard-Port (kein echtes Obfuscation)
 ListenPort = 443
 
 # DNS-over-HTTPS
@@ -1786,6 +1788,7 @@ Das Script wird "wie gesehen" bereitgestellt. Obwohl es sorgfältig entwickelt u
 - **v1.3** - Automatische Updates und Debian 12 Kompatibilität
 - **v1.4** - Sicherheits- und Stabilitäts-Fixes (SHA256-verifiziertes Auto-Update, awk-basiertes `remove_client`, `SaveConfig=false`, vollständiger CSV-Bulk-Import, Eingabe-Validierung)
 - **v1.4.1** - Alpine-Fix: `libqrencode-tools` statt `qrencode` ([Issue #1](https://github.com/CallMeTechie/wireguard.ai/issues/1))
+- **v1.4.2** - Stabilität & Härtung: `set -e` entfernt, `umask 077` in `generate_keys`, Schutz gegen Server-Config-Überschreiben in Client-Setup, vollständiger iptables-Branch + Persistierung, Backup-Retention (`BACKUP_KEEP`), optionaler IPv6-Dual-Stack im Custom-Template, harter Abbruch bei unbekannter Distribution, Privacy-Template-Beschreibung korrigiert
 
 ---
 
