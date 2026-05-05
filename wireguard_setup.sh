@@ -519,6 +519,10 @@ remove_client() {
     local temp_file
     temp_file=$(mktemp)
 
+    # Hinweis: Bewusst nur POSIX-awk-Features. mawk (Debian-Default) und
+    # busybox-awk (Alpine) unterstützen NICHT match($0, /.../, array) mit
+    # drittem Argument — das ist eine GNU-Erweiterung. Stattdessen nutzen
+    # wir den Pattern-Match per Regex-Operator und sub() für die Extraktion.
     awk -v target="$client_name" '
         BEGIN { in_peer = 0; buf = ""; skip = 0 }
         function flush_buf() {
@@ -539,8 +543,9 @@ remove_client() {
         {
             if (in_peer) {
                 # Kommentar mit Client-Namen?
-                if (match($0, /^[[:space:]]*#[[:space:]]*([^[:space:]].*)$/, m)) {
-                    name = m[1]
+                if ($0 ~ /^[[:space:]]*#[[:space:]]*[^[:space:]]/) {
+                    name = $0
+                    sub(/^[[:space:]]*#[[:space:]]*/, "", name)
                     sub(/[[:space:]]+$/, "", name)
                     if (name == target) { skip = 1; buf = ""; next }
                 }
@@ -1744,5 +1749,9 @@ main() {
     main_menu
 }
 
-# Script starten
-main "$@"
+# Script starten — nur bei direkter Ausführung. Wenn das Skript per `source`
+# eingebunden wird (z. B. von bats-Tests), wird main NICHT aufgerufen, sodass
+# einzelne Funktionen isoliert getestet werden können.
+if [[ "${BASH_SOURCE[0]}" == "${0}" ]]; then
+    main "$@"
+fi
