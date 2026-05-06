@@ -1789,6 +1789,7 @@ Das Script wird "wie gesehen" bereitgestellt. Obwohl es sorgfältig entwickelt u
 - **v1.4** - Sicherheits- und Stabilitäts-Fixes (SHA256-verifiziertes Auto-Update, awk-basiertes `remove_client`, `SaveConfig=false`, vollständiger CSV-Bulk-Import, Eingabe-Validierung)
 - **v1.4.1** - Alpine-Fix: `libqrencode-tools` statt `qrencode` ([Issue #1](https://github.com/CallMeTechie/wireguard.ai/issues/1))
 - **v1.4.2** - Stabilität & Härtung: `set -e` entfernt, `umask 077` in `generate_keys`, Schutz gegen Server-Config-Überschreiben in Client-Setup, vollständiger iptables-Branch + Persistierung, Backup-Retention (`BACKUP_KEEP`), optionaler IPv6-Dual-Stack im Custom-Template, harter Abbruch bei unbekannter Distribution, Privacy-Template-Beschreibung korrigiert
+- **v1.4.3** - Portabilität & Test-Infrastruktur: portables awk in `remove_client` (mawk/busybox-Kompatibilität), `ufw`/`iptables-persistent`-Konflikt auch auf Ubuntu 24.04 sauber gelöst, `install_dependencies` schlägt bei kritischen Paketen fail-hard statt silent success; GitHub-Actions-Workflows für Lint+Unit-Tests und Distro-Matrix-Smoke-Tests (debian/ubuntu/alpine/fedora/arch)
 
 ---
 
